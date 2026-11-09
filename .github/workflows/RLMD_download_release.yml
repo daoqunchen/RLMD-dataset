@@ -1,9 +1,20 @@
 name: RLMD
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      resume_run_id:
+        description: '上次失败运行的 Run ID（首次运行留空，从运行页 URL 末尾取）'
+        required: false
+        default: ''
 permissions:
   contents: write
+  actions: read
+concurrency:
+  group: rlmd-download
+  cancel-in-progress: false
 env:
   FOLDER_ID: 18-Lnz2MaPQWSOJ8aK1ikkwXLLdjImYOA
+  ROUNDS: 3
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -15,28 +26,103 @@ jobs:
           gh release view rlmd-data --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
           gh release create rlmd-data --repo "$GITHUB_REPOSITORY" \
             --title "RLMD 数据集" \
-            --notes "来源：Hsiao et al., RLMD: A Dataset for Road Marking Segmentation, ICCE-Taiwan 2023, DOI 10.1109/ICCE-Taiwan58799.2023.10226935；官方仓库 https://github.com/stu9113611/RLMD 。请按官方许可与引用要求使用。"
+            --notes "来源：Hsiao et al., RLMD, ICCE-Taiwan 2023, DOI 10.1109/ICCE-Taiwan58799.2023.10226935；官方仓库 https://github.com/stu9113611/RLMD 。请按官方许可与引用要求使用。"
 
   fetch:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
-      - name: 下载 Drive 文件夹
-        run: |
-          pip install -q --upgrade gdown
-          mkdir -p RLMD
-          for i in 1 2 3; do
-            gdown "https://drive.google.com/drive/folders/${FOLDER_ID}" \
-              -O RLMD --folder && break
-            echo "第 $i 次失败，60 秒后重试"; sleep 60
-          done
-          echo "=== 文件清单（前 100 行）==="
-          find RLMD -type f | head -100
-          echo "文件总数: $(find RLMD -type f | wc -l)"
-          du -sh RLMD
+      - name: 恢复上次已下载文件
+        if: ${{ inputs.resume_run_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: RLMD-raw
+          path: RLMD
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
 
-      - name: 先存一份到 Artifact（7 天）
+      - name: 恢复断点清单
+        if: ${{ inputs.resume_run_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: RLMD-manifest
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: 下载 / 补漏
+        run: |
+          set -u
+          pip install -q --upgrade 'gdown>=6.2.0'
+          mkdir -p RLMD
+
+          # 首次：整文件夹下载，允许部分失败，日志留档
+          if [ ! -f gdown.log ]; then
+            gdown "https://drive.google.com/drive/folders/${FOLDER_ID}" \
+              -O RLMD --folder 2>&1 | tee gdown.log || true
+          fi
+
+          # 从日志提取全部失败项（ID + 完整路径），合并上轮遗留
+          python3 - <<'PY'
+          import re, os
+          log = open('gdown.log', errors='ignore').read() if os.path.exists('gdown.log') else ''
+          seen, rows = set(), []
+          for block in re.split(r'(?=Failed to download )', log):
+              m = re.match(r'Failed to download (.+?):', block)
+              if not m: continue
+              i = re.search(r'uc\?id=([A-Za-z0-9_-]+)', block)
+              if not i: continue
+              k = (i.group(1), m.group(1))
+              if k not in seen: seen.add(k); rows.append(k)
+          if os.path.exists('missing.tsv'):
+              for l in open('missing.tsv'):
+                  p = l.rstrip('\n').split('\t')
+                  if len(p) == 2 and tuple(p) not in seen: rows.append(tuple(p))
+          open('missing.tsv','w').write(''.join(f'{a}\t{b}\n' for a,b in rows))
+          print('待补漏文件数:', len(rows))
+          PY
+
+          # 逐文件补漏：跳过已有，逐个间隔 3 秒降速，失败留到下一轮
+          for round in $(seq 1 "$ROUNDS"); do
+            [ -s missing.tsv ] || break
+            echo "=== 补漏第 $round 轮（剩余 $(wc -l < missing.tsv) 个）==="
+            python3 - <<'PY'
+          import subprocess, pathlib, time, sys
+          rows = [l.rstrip('\n').split('\t') for l in open('missing.tsv') if '\t' in l]
+          left = []
+          for fid, rel in rows:
+              p = pathlib.Path(rel)
+              if p.exists() and p.stat().st_size > 0:
+                  print(f'[skip] {rel}', file=sys.stderr); continue
+              p.parent.mkdir(parents=True, exist_ok=True)
+              r = subprocess.run(['gdown', f'https://drive.google.com/uc?id={fid}', '-O', str(p)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              if r.returncode == 0 and p.exists() and p.stat().st_size > 0:
+                  print(f'[ ok ] {rel}', file=sys.stderr)
+              else:
+                  print(f'[fail] {rel} ({fid})', file=sys.stderr)
+                  left.append((fid, rel))
+              time.sleep(3)
+          open('missing.tmp','w').write(''.join(f'{a}\t{b}\n' for a,b in left))
+          PY
+            mv missing.tmp missing.tsv
+            if [ -s missing.tsv ]; then
+              echo "仍缺 $(wc -l < missing.tsv) 个，等 5 分钟再试"; sleep 300
+            fi
+          done
+
+          echo "=== 最终状态 ==="
+          echo "文件总数: $(find RLMD -type f | wc -l)"
+          echo "仍缺失:   $(wc -l < missing.tsv)"
+          find RLMD -type f | head -20
+
+          # 完整性门禁：有缺失就红，且绝不进入发布步骤
+          [ ! -s missing.tsv ] || { echo "::error::存在缺失文件，禁止打包发布"; exit 1; }
+
+      - name: 先存散文件到 Artifact（7 天）
+        if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -44,12 +130,26 @@ jobs:
           path: RLMD/
           retention-days: 7
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: warn
+
+      - name: 保存断点清单（供 resume）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RLMD-manifest
+          path: |
+            missing.tsv
+            gdown.log
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: 打包并发布到 Release
+        if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          find RLMD -type d -name '__MACOSX' -prune -exec rm -rf {} +
+          find RLMD -type f \( -name '._*' -o -name '.DS_Store' \) -delete
           (cd RLMD && zip -q -r -0 ../rlmd.zip .)
           ls -lh rlmd.zip
           sha256sum rlmd.zip | tee rlmd.zip.sha256
