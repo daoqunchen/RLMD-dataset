@@ -1,0 +1,64 @@
+name: RLMD
+on: workflow_dispatch
+permissions:
+  contents: write
+env:
+  FOLDER_ID: 18-Lnz2MaPQWSOJ8aK1ikkwXLLdjImYOA
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 创建公开 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view rlmd-data --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create rlmd-data --repo "$GITHUB_REPOSITORY" \
+            --title "RLMD 数据集" \
+            --notes "来源：Hsiao et al., RLMD: A Dataset for Road Marking Segmentation, ICCE-Taiwan 2023, DOI 10.1109/ICCE-Taiwan58799.2023.10226935；官方仓库 https://github.com/stu9113611/RLMD 。请按官方许可与引用要求使用。"
+
+  fetch:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 下载 Drive 文件夹
+        run: |
+          pip install -q --upgrade gdown
+          mkdir -p RLMD
+          for i in 1 2 3; do
+            gdown "https://drive.google.com/drive/folders/${FOLDER_ID}" \
+              -O RLMD --folder && break
+            echo "第 $i 次失败，60 秒后重试"; sleep 60
+          done
+          echo "=== 文件清单（前 100 行）==="
+          find RLMD -type f | head -100
+          echo "文件总数: $(find RLMD -type f | wc -l)"
+          du -sh RLMD
+
+      - name: 先存一份到 Artifact（7 天）
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: RLMD-raw
+          path: RLMD/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: 打包并发布到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd RLMD && zip -q -r -0 ../rlmd.zip .)
+          ls -lh rlmd.zip
+          sha256sum rlmd.zip | tee rlmd.zip.sha256
+          if [ "$(stat -c%s rlmd.zip)" -gt 2147483648 ]; then
+            split -b 1500m -d rlmd.zip rlmd.zip.part-
+            rm rlmd.zip
+          fi
+          shopt -s nullglob
+          for p in rlmd.zip rlmd.zip.sha256 rlmd.zip.part-*; do
+            gh release upload rlmd-data "$p" --repo "$GITHUB_REPOSITORY" --clobber
+            echo "已上传 $p"
+          done
